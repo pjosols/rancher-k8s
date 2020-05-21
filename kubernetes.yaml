@@ -1,0 +1,278 @@
+---
+- name: Rancher Kubernetes orchestration
+  hosts: localhost
+  gather_facts: no
+  become: no
+
+  vars_files:
+    - vars/my_k8s_cluster.yaml
+
+  # Note you can use "--skip-tags pure_storage" to skip creating a datastore on a FlashArray, but you'll need to first
+  # add a datastore named like "VMFS-{{ region }}R0DVP-{{ cluster_name }}"
+
+  # If you don't need Dynamic Volume Provisioning, use "--skip-tags dvp"
+
+  tasks:
+
+    - name: Install eportal node driver
+      rancher_nodedriver:
+        host: "{{ rancher_host }}"
+        user: "{{ rancher_access_key }}"
+        password: "{{ rancher_secret_key }}"
+        name: eportal
+        url: "{{ eportal_node_driver_url }}"
+        uiUrl: "{{ eportal_node_driver_ui_url }}"
+      tags: ['nodedriver']
+
+    # wait until node driver is ready
+    - name: Wait for the node driver to become active
+      rancher_nodedriver_info:
+        host: "{{ rancher_host }}"
+        user: "{{ rancher_access_key }}"
+        password: "{{ rancher_secret_key }}"
+        name: eportal
+      register: nodedriver_info
+      delay: 10
+      retries: 6  # wait up to 3 hours for entire cluster to finish
+      until: nodedriver_info.resource.data[0].state == "active"
+
+    - name: Create node templates needed for cluster {{ cluster_name }}.
+      rancher_nodetemplate:
+        host:     "{{ rancher_host }}"
+        user:     "{{ rancher_access_key }}"
+        password: "{{ rancher_secret_key }}"
+        name:     "{{ cluster_name }}-{{ item.key }}"  # pauls-test-cluster-master
+        server:   "{{ eportal_host }}"
+        token:    "{{ rancher_eportal_token }}"  # the token used by rancher
+        region:   "{{ region }}"
+        network:  "{{ network }}"
+        # ssh_user: "{{ ssh_user }}"  # we could say user 'rancher' for example if eportal backend would add ssh key to rancher user
+        cpu:      "{{ item.value.cpu }}"
+        memory:   "{{ item.value.memory }}"
+        disk:     "{{ item.value.disk }}"
+        labels:   "{{ item.value.labels if item.value.labels is defined else omit }}"
+        image: "centos7"
+        engine_install_url: "https://releases.rancher.com/install-docker/18.09.sh"
+        engine_storage_driver: "overlay2"
+        engine_options:
+          ip-forward: true
+          ip-masq: true
+          log-driver: json-file
+          log-opt: max-size=50m
+          selinux-enabled: true
+      with_dict: "{{ cluster_nodes }}"
+
+
+    - name: Create cluster {{ cluster_name }}.
+      rancher_cluster:
+        host: "{{ rancher_host }}"
+        user: "{{ rancher_access_key }}"
+        password: "{{ rancher_secret_key }}"
+        name: "{{ cluster_name }}"
+        cni_provider: "{{ cni_provider }}"
+        ingress_provider: "{{ ingress_provider }}"
+        kubernetes_version: "{{ kubernetes_version }}"
+        region: "{{ region }}"
+        enable_dvp: "{{ enable_dvp }}"
+
+        # Optional vcenter config when enable_dvp is true
+        vcenter_host: "{{ vcenter_host }}"
+        vcenter_user: "{{ rancher_vcenter_user }}"
+        vcenter_password: "{{ rancher_vcenter_password }}"
+        vcenter_machine_folder: "{{ group }} {{ region }}"  # should match where eportal puts the machines
+        vcenter_datastore: "VMFS-{{ region }}R0DVP-{{ cluster_name }}"
+
+
+    - name: Create node pools
+      rancher_nodepool:
+        host: "{{ rancher_host }}"
+        user: "{{ rancher_access_key }}"
+        password: "{{ rancher_secret_key }}"
+        name: "{{ cluster_name  }}-{{ item.key }}"
+        cluster: "{{ cluster_name }}"
+        prefix: "{{ item.value.prefix }}"
+        quantity: "{{ item.value.quantity }}"
+        controlplane: "{{ item.value.controlplane }}"
+        etcd: "{{ item.value.etcd }}"
+        worker: "{{ item.value.worker }}"
+      with_dict: "{{ cluster_nodes }}"
+
+
+
+    # Dynamic Provisioning Steps -- when enable_dvp is true
+    - set_fact:
+        vol_name: "VMFS-{{ region }}R0DVP-{{ cluster_name }}"
+      when: enable_dvp is true
+
+    # Create the volume on a Pure Storage FlashArray
+    - name: Create {{ dvp_volume_size }} volume {{ vol_name }} on {{ flasharray_hosts[region] }}
+      purefa_volume:
+        name: "{{ vol_name }}"
+        size: "{{ dvp_volume_size }}"
+        fa_url: "{{ flasharray_hosts[region] }}"
+        api_token: "{{ flasharray_tokens[region] }}"
+        state: present
+      register: purefa_volume__result
+      tags: ['pure_storage', 'dvp']
+      when: enable_dvp is true
+
+    - name: Add hosts and volumes to existing or new hostgroup
+      purefa_hg:
+        hostgroup: "{{ flasharray_hostgroups[region] }}"
+        volume:
+          - "{{ vol_name }}"
+        fa_url: "{{ flasharray_hosts[region] }}"
+        api_token: "{{ flasharray_tokens[region] }}"
+      ignore_errors: yes  # ?!
+      tags: ['pure_storage', 'dvp']
+      when: enable_dvp is true
+
+    - name: Get volume naa value.
+      purefa_info:
+        gather_subset:
+          - volumes
+        fa_url: "{{ flasharray_hosts[region] }}"
+        api_token: "{{ flasharray_tokens[region] }}"
+      register: volume_info
+      no_log: yes  # because it's long
+      tags: ['pure_storage', 'dvp']
+      when: enable_dvp is true
+
+    - name:  Set the VMFS device naa name from the Pure volume serial number and Pure Storage WWN prefix.
+      set_fact:
+        vmfs_device_name: "{{ flasharray_volume_prefix }}{{ volume_info.purefa_info.volumes[ vol_name ].serial | lower }}"
+      tags: ['pure_storage', 'dvp']
+      when: enable_dvp is true
+
+    # Do the VMware work
+    - name: Rescan HBA's for a given ESXi host and refresh storage system objects
+      vmware_host_scanhba:
+        hostname: "{{ vcenter_host }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        esxi_hostname: "{{ esxi_hosts[region] }}"
+        refresh_storage: true  # all found hosts will be scanned
+      tags: ['dvp']
+      when: enable_dvp is true
+
+    - name: Mount DVP VMFS datastores to ESXi
+      vmware_host_datastore:
+        hostname: "{{ vcenter_host }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datastore_name: "{{ vol_name }}"
+        datastore_type: vmfs
+        vmfs_device_name: "{{ vmfs_device_name }}"
+        vmfs_version: 5
+        esxi_hostname: "{{ esxi_hosts[region] }}"
+        state: present
+      tags: ['dvp']
+      when: enable_dvp is true
+
+    - name: Assign permission to DVP datastore
+      vmware_object_role_permission:
+        hostname: "{{ vcenter_host }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        role: manage-k8s-volumes
+        principal: "{{ rancher_vcenter_user }}"
+        object_name: "{{ vol_name }}"
+        object_type: Datastore
+        recursive: no
+        state: present
+      tags: ['dvp']
+      when: enable_dvp is true
+
+    # Get the kubeconfig -- needed for dvp work
+    - name: Wait for the cluster to become active
+      rancher_cluster_info:
+        host: "{{ rancher_host }}"
+        user: "{{ rancher_access_key }}"
+        password: "{{ rancher_secret_key }}"
+        name: "{{ cluster_name  }}"
+      register: cluster_info
+      delay: 60
+      retries: 180  # wait up to 3 hours for entire cluster to finish
+      until: cluster_info.resource.data[0].state == "active"
+      tags: ['dvp']
+      when: enable_dvp is true
+
+    - name: Fetch the cluster kubeconfig
+      rancher_kubeconfig:
+        host: "{{ rancher_host }}"
+        user: "{{ rancher_access_key }}"
+        password: "{{ rancher_secret_key }}"
+        name: "{{ cluster_name  }}"
+      register: kubeconfig_result
+      no_log: true  # for security
+      tags: ['dvp']
+      when: enable_dvp is true
+
+    - set_fact:
+        kubeconfig: "{{ kubeconfig_result.resource.config }}"
+      no_log: true  # for security
+      tags: ['dvp']
+      when: enable_dvp is true
+
+    # Finally create the DVP storage class
+    - name: Fail when no kubeconfig
+      fail:
+        msg: "kubeconfig is missing"
+      when:
+        - kubeconfig is undefined or kubeconfig|length == 0
+        - enable_dvp is true
+      tags: ['dvp']
+
+    - block:
+        - name: Copy kube config file
+          copy:
+            content: "{{ kubeconfig }}"
+            dest: "{{ playbook_dir }}/kube_config"
+          no_log: yes
+
+        - name: Add k8s storage class
+          k8s:
+            state: present
+            definition: "{{ lookup('template', 'storageclass.yaml.j2') }}"
+            kubeconfig: "{{ playbook_dir }}/kube_config"
+            wait: yes
+            wait_timeout: 300
+          register: storageclass
+          until: storageclass is succeeded
+          delay: 10
+          retries: 6
+
+        - name: Test pvc using storage class
+          k8s:
+            state: present
+            definition: "{{ lookup('template', 'test_pvc.yaml.j2') }}"
+            kubeconfig: "{{ playbook_dir }}/kube_config"
+            wait: yes
+            wait_timeout: 300
+          register: pvc_test
+          tags:
+            - pvc_test
+          ignore_errors: true  # this might fail if some esxi hosts fail to rescan, which happens
+
+        - name: Remove test pvc
+          k8s:
+            state: absent
+            definition: "{{ lookup('template', 'remove_test_pvc.yaml.j2') }}"
+            kubeconfig: "{{ playbook_dir }}/kube_config"
+            wait: yes
+            wait_timeout: 300
+          when: pvc_test is defined and pvc_test|length > 0
+          tags:
+            - pvc_test
+          ignore_errors: true  # this might fail if some esxi hosts fail to rescan, which happens
+
+      always:
+        - name: remove kubeconfig
+          file:
+            dest: "{{ playbook_dir }}/kube_config"
+            state: absent
+      tags: ['dvp']
+      when: enable_dvp is true

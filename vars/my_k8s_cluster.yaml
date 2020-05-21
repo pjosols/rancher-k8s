@@ -1,0 +1,49 @@
+---
+# Group specific information
+group: EngOps # should be the same group as the one associated with the eportal token provided
+
+# Cluster details
+cluster_name: pauls-test-1016
+region: NYC01
+network: UAT1
+
+# Dynamic Volume Provisioning
+enable_dvp: no
+dvp_volume_size: 5G
+
+# Providers
+cni_provider: calico
+ingress_provider: nginx
+kubernetes_version: v1.15.4-rancher1-2
+
+# Node specs
+cluster_nodes:
+  master:
+    cpu: 2
+    memory: 2
+    disk: 20
+    prefix: nycdc01test50
+    quantity: 1
+    controlplane: yes
+    etcd: yes
+    worker: no
+  worker:
+    cpu: 2
+    memory: 2
+    disk: 20
+    prefix: nycdc01test60
+    quantity: 1
+    controlplane: no
+    etcd: no
+    worker: yes
+  couchbase:
+    cpu: 2
+    memory: 2
+    disk: 20
+    prefix: nycdc01test70
+    quantity: 1
+    controlplane: no
+    etcd: no
+    worker: yes
+    labels:
+      pool-couchbase: true

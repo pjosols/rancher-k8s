@@ -1,0 +1,17 @@
+---
+- name: Get node command from Rancher
+  hosts: localhost
+  become: no
+  gather_facts: no
+
+  tasks:
+    - name: Query Rancher for node command
+      rancher_clusterregistrationtoken:
+        host: "{{ rancher_host }}"
+        user: "{{ rancher_access_key }}"
+        password: "{{ rancher_secret_key }}"
+        name: "{{ cluster_name }}"
+      register: cluster_info
+
+    - debug:
+        var: cluster_info.resource.data.0

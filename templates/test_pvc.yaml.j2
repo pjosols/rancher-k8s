@@ -1,0 +1,31 @@
+---
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: pvcsc001
+  namespace: default
+  annotations:
+    volume.beta.kubernetes.io/storage-class: vsphere
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pvpod
+  namespace: default
+spec:
+  containers:
+  - name: test-container
+    image: {{ pvc_test_image }}
+    volumeMounts:
+    - name: test-volume
+      mountPath: /test
+  volumes:
+  - name: test-volume
+    persistentVolumeClaim:
+      claimName: pvcsc001
