@@ -78,8 +78,8 @@ Sample config file
 Author Information
 ==================
 
-Paul Olsen  -- Rancher modules and tasks
+Paul Olsen -- Ansible modules and Rancher tasks
 
-Sam Chen -- DVP tasks
+Sam Chen -- DVP and Rancher tasks
 
 
